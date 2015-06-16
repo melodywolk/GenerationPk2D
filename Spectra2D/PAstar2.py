@@ -1,0 +1,141 @@
+import minepsds
+import pyfits
+import numpy as np
+import pylab as py
+import matplotlib.pyplot as plt
+import fnmatch
+import os
+import convertlog
+from scipy.integrate import simps
+from scipy.special import jv
+import proj
+from smoothfunc import smooth
+from gfield2dv2 import gfield2d
+
+
+def predictPAstar(l, Cl, kin, Nreal, xibar, Nboxsize, Ngal, Volume):
+  
+    L=np.sqrt(Volume)
+    Nmean=Ngal/Nboxsize**2
+    # Interpolate with a finer grid to have better precision
+    maxl=np.max(l)
+    minl=np.min(l)
+   
+    lnlfine=np.linspace(np.log(minl), np.log(maxl), 30000)
+    lfine=np.exp(lnlfine)
+    lnl=np.log(l)
+    lnCl=np.log(Cl)
+    Clfine=np.exp(np.interp(lnlfine, lnl, lnCl))
+    N=len(kin)
+    # Grid in angular distance for predictions
+    lnr=np.linspace(np.log(0.001), np.log(2.), 50)
+    r=np.exp(lnr)*(np.pi/180.)
+
+    pcf=np.zeros((len(r)))
+
+    for i in range(0, len(r)):
+      pcf[i]=(1./(2*np.pi))*simps(lfine*Clfine*jv(0,lfine*r[i]),lfine) 
+    cutoff=2.0*(np.pi/180.) 
+    sel=(r>=cutoff)
+    pcf[sel]=pcf[sel]*np.exp(-(r[sel]/cutoff))
+
+    # Variance of A
+    sigmaA2=np.log(1.+pcf)
+
+    # k-grid
+    lnk=np.linspace(np.log(minl), np.log(maxl), 50)
+    k=np.exp(lnk)
+    Pk=np.zeros((len(k)))
+    # Fine grid in angular distance for the integral
+    lnrfine=np.linspace(np.log(0.001), np.log(2.), 30000)
+    rfine=np.exp(lnrfine)*(np.pi/180.)
+    wfine=np.interp(rfine, r, smooth(sigmaA2))
+
+    # Calculate P(A)
+    for i in range(0, len(k)):
+       Pk[i]=(2*np.pi)*simps(rfine*wfine*jv(0,rfine*k[i]),rfine)
+
+    # Map N to A*
+    Nmap=np.arange(0,500, dtype=np.intp)
+    Amap=np.zeros(len(Nmap))
+    n12 = (Nmap-0.5)/Nmean
+    s2a = np.log(1.+xibar)
+    Nca = s2a*Nmean
+    for j in range(0, len(Nmap)):
+       Amap[j] = convertlog.lnrhostar(Nca, n12[j])
+   
+    klog=np.zeros(N).reshape(N)
+    Pklog=np.zeros(N).reshape(N)
+    #cov1log=np.zeros((N, N)).reshape((N, N))
+    f_k=2.*np.pi/L
+    kN=np.zeros(N).reshape(N)
+    PkN=np.zeros(N).reshape(N)
+    #cov1N=np.zeros((N, N)).reshape((N, N))
+    f_PkN=Volume/Ngal**2.
+    f_Pklog=Volume/Nboxsize**4.
+    
+    #print smooth(Pk)
+    Nfield=np.zeros((Nboxsize, Nboxsize)).reshape((Nboxsize, Nboxsize))
+    Astarfield=np.zeros((Nboxsize, Nboxsize)).reshape((Nboxsize, Nboxsize))
+    #covtotlog=np.zeros((N, N)).reshape((N, N))
+    #covtot=np.zeros((N, N)).reshape((N, N))
+    for q in range(0,Nreal):
+     # Generate a Gaussian field with the power spectrum of A 
+     bigbox=gfield2d(512, k, smooth(Pk), 4*Volume)
+     smallbox=bigbox[0:256, 0:256]
+     gauss=bigbox[0:256:2,0:256:2]
+    
+     # Construct the underlying field
+     deltac=np.exp(gauss-0.5*np.var(bigbox))-1.
+     
+     # Generate discrete distribution (Poisson sampling) and calculate A*
+     for i in range(0,Nboxsize):
+        for j in range(0,Nboxsize):
+            nb = np.random.poisson(Nmean*(1.+deltac[i,j]))
+            Nfield[i,j] = nb
+            Astarfield[i,j] = Amap[nb]
+     # Calculate power spectrum of A*
+     fft_log=minepsds.PSD2(Astarfield, image2=None)
+     
+     ko, Pko, errlog=minepsds.pspec(fft_log)
+     Pko=np.array(Pko)*f_Pklog
+     ko=np.array(ko)*f_k
+     Pkgo = np.exp(np.interp(np.log(kin), np.log(ko), np.log(Pko)))
+     klog+=kin
+     Pklog+=Pkgo
+     # Calculate power spectrum of N
+     fft=minepsds.PSD2(Nfield, image2=None)
+     kNo, PkNo, errN=minepsds.pspec(fft)
+     PkNo=np.array(PkNo)*f_PkN
+     kNo=np.array(kNo)*f_k
+    
+     PkNgo = np.exp(np.interp(np.log(kin), np.log(kNo), np.log(PkNo)))
+     kN+=kin
+     PkN+=PkNgo
+
+     #for i in range(0, N):
+     #   for j in range(0, N):
+     #       cov1log[i,j] += Pkgo[i]*Pkgo[j]
+     #       cov1N[i,j] += PkNgo[i]*PkNgo[j]
+
+    klmean=klog/Nreal
+    Pklmean=Pklog/Nreal
+    kmean=kN/Nreal
+    Pkmean=PkN/Nreal
+     
+    
+    #for i in range(0, N):
+    #  for j in range(0, N):
+    #    covtotlog[i,j]= (cov1log[i,j]/Nreal) - (Pklog[i]*Pklog[j]/Nreal**2) 
+    #    covtot[i,j]= (cov1N[i,j]/Nreal) - (PkN[i]*PkN[j]/Nreal**2)
+   
+    #return covtot, klmean, Pklmean, covtotlog
+    return kmean, Pkmean, klmean, Pklmean
+
+
+
+
+
+
+
+
